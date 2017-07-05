@@ -9,7 +9,7 @@
 //#define LOOPBACK
 #define DEBUG
 
-#define NOTSENDCAN
+//#define NOTSENDCAN
 
 /*Defining the bitwise functions (bitwise operators)
 We're using bits to store data because there are only 8 bytes available for use in a CAN packet.
@@ -40,7 +40,7 @@ char old;          //old is the previous switch states
 //Conversion data for displayed measurements
 #define MPS_TO_MPH 2.2369f
 
-//Steering Wheel LCD Info - the position on the LCD
+//Steering Wheel LCD locations - the position of the information on the LCD
 //const int SOC = 8;    //state of charge (from CAN)
 const int V = 6;      //velocity (from CAN)
 const int GEAR = 13;  //forward/reverse/neutral
@@ -49,6 +49,16 @@ const int LIGHT = 11; //headlights/hazardlights/no lights
 const int RIGHT = 15; //right turn signals
 const int LEFT = 1;   //left turn signals
 const int TELM = 0;   //telemetry indicator
+
+//BMS Error Strings
+#define BMS_12VERR_STR              String("TRIP: 12V ERR")
+#define BMS_DRIVECONTROLSERR_STR    String("TRIP: DCTRLS ERR")
+#define BMS_CONTACTERR_STR          String("TRIP: CNTCR ERR")
+#define BMS_CURRENTERR_STR          String("TRIP: OVERCURRENT") // This currently doesn't do anything since the BMS doesn't report current trips
+#define BMS_OVVOLTAGE_STR           String("TRIP: OVER V")
+#define BMS_UNVOLTAGE_STR           String("TRIP: UNDER V")
+#define BMS_UNKERR_STR              String("TRIP: UNK. ERR")
+#define GENERIC_TRIP_STR            String("SOMETHING IS WRONG WITH YOUR CAR")
 
 //set up pins that connect to switch terminals
 const int fgp =   6;  //forward gear
@@ -59,6 +69,8 @@ const int laptimerp =   A1;  //lap timer reset
 const int hornp = 5; //horn
 const int ltp =   3;  //left turn
 const int rtp =   A2;  //right turn
+const int displupp   = 4; // rotate display selection up
+const int displdownp = A0; // rotate display selection down
 
 //set up metro timer
 //1st: switch state reading timer - frequency at which switches are read
@@ -90,6 +102,8 @@ CAN_IO CanControl(CAN_CS, CAN_INT, CAN_BAUD_RATE, CAN_FREQ); //Try initializing 
 //Declaring switch objects (for debouncing, based on the included Switch library)
 Switch laptimerreset(laptimerp);
 Switch horn(hornp);
+Switch displup(displupp);
+Switch displdown(displdownp);
 
 //Declaring serLCD object (display, based on the NUserLCD library)
 serLCD_buffered screen(Serial1);
@@ -102,11 +116,21 @@ struct LCD{
   char geardisplay;      //'F' = forward, 'R' = reverse, 'N' = neutral
   char telemetrydisplay; //'T' = telemetry on, ' ' = telemetry off
   String Lightsdisplay;  //"H" = headlights, "HZ" = hazardlights, " " = no lights
+
+#define DISPLAY_NUMBER_MAX  6
   //float SOCdisplay;        //state of charge (from CAN)
   float Veldisplay;        //velocity (from CAN)
+  float MCurrentdisplay;    // Motor Current (from CAN)
+  float ACurrentdisplay;    // Array Current (from CAN)
+  float BCurrentdisplay;    // Battery Current (from CAN)
+  float BVoltagedisplay;    // Pack Voltage (from CAN)
+  float MaxTempdisplay;     // Max Pack Temp (from CAN)
+  uint8_t displayNumber;    // Selects which value to display
+  
   boolean LTdisplay;     //distinguishes left turn
   boolean RTdisplay;     //distinguishes right turn
   boolean turnsignal_on; //whether turn signal is on/off
+  boolean tripped;       //is the car tripped?
   String notification; //notification string
 };
 LCD steering_wheel;
@@ -139,6 +163,8 @@ void setup() {
   pinMode(hornp, INPUT_PULLUP);
   pinMode(ltp, INPUT_PULLUP);
   pinMode(rtp, INPUT_PULLUP);
+  pinMode(displupp, INPUT_PULLUP);
+  pinMode(displdownp, INPUT_PULLUP);
 
   //set Serial and screen baud rate to 9600bps
   Serial.begin(9600);
@@ -159,8 +185,8 @@ void setup() {
    * Configure RB0 to take SOC and Velocity packets for the display.
    * RB1 can be used for other packets as needed.
    */
-  CanControl.filters.setRB0(MASK_Sxxx,BMS_SOC_ID,0); 
-  CanControl.filters.setRB1(MASK_Sxxx,MC_VELOCITY_ID,0,0,0);
+  CanControl.filters.setRB0(MASK_Sxxx,BMS_VOLT_CURR_ID,DC_TEMP_1_ID); 
+  CanControl.filters.setRB1(MASK_Sxxx,MC_VELOCITY_ID,MC_BUS_STATUS_ID,DC_INFO_ID,0);
   CanControl.Setup(RX0IE|RX1IE);
 
 #ifdef LOOPBACK 
@@ -173,9 +199,13 @@ void setup() {
 
   //Initialize turnsignal_on state
   steering_wheel.turnsignal_on = false;
-  
+
+  // Initialze lap timer display
   steering_wheel.lapmindisplay = 0;
   steering_wheel.lapsecdisplay = 00;
+
+  // Initialize display selector variable
+  steering_wheel.displayNumber = 0;
   
 #ifdef DEBUG
   Serial.print("CANINTE: " );
@@ -236,10 +266,6 @@ inline void defaultdisplay(){
   screen.print(steering_wheel.lapdisplay);
   screen.setCursor(1,GEAR);
   screen.print(steering_wheel.geardisplay);
-  screen.setCursor(2,V-2);
-  screen.print("V:");
-  screen.setCursor(2,V);
-  screen.print(min(99,int(steering_wheel.Veldisplay)));
   screen.setCursor(2,LIGHT);
   screen.print(steering_wheel.Lightsdisplay);
   screen.setCursor(2,TELM);
@@ -250,6 +276,52 @@ inline void defaultdisplay(){
 
   if(steering_wheel.RTdisplay || steering_wheel.Lightsdisplay=="HZ"){
     blnk(RIGHT,steering_wheel.turnsignal_on);
+  }
+  
+  /* Display Rotatable Statuses */
+  switch (steering_wheel.displayNumber) {
+    case 0: // Velocity
+      screen.setCursor(2,V-2);
+      screen.print("V:");
+      screen.setCursor(2,V);
+      screen.print(min(99,int(steering_wheel.Veldisplay)));
+    break;
+    case 1: // Motor Current
+      screen.setCursor(2,V-2);
+      screen.print("M:");
+      screen.setCursor(2,V);
+      screen.print(int(steering_wheel.MCurrentdisplay));
+    break;
+    case 2: // Array Current
+      screen.setCursor(2,V-2);
+      screen.print("A:");
+      screen.setCursor(2,V);
+      screen.print(int(steering_wheel.ACurrentdisplay));
+    break;
+    case 3: // Battery Current
+      screen.setCursor(2,V-2);
+      screen.print("B:");
+      screen.setCursor(2,V);
+      screen.print(int(steering_wheel.BCurrentdisplay));
+    break;
+    case 4: // Battery Current
+      screen.setCursor(2,V-2);
+      screen.print("B:");
+      screen.setCursor(2,V);
+      screen.print(int(steering_wheel.BCurrentdisplay));
+    break;
+    case 5: // Pack Voltage
+      screen.setCursor(2,V-2);
+      screen.print("P:");
+      screen.setCursor(2,V);
+      screen.print(int(steering_wheel.BVoltagedisplay));
+    break;
+    case 6: // Max Pack Temp Display
+      screen.setCursor(2,V-2);
+      screen.print("T:");
+      screen.setCursor(2,V);
+      screen.print(min(99,int(steering_wheel.MaxTempdisplay)));
+    break;
   }
 }
 
@@ -290,6 +362,15 @@ void loop() {
     horn.poll();
     switchBit(!horn.on(), young, HORN);
     switch_timer.reset();
+
+    /* rotate the displayNumber variable when the driver presses the scroll buttons (previously cruise controll buttons) */
+    displup.poll(); displdown.poll();
+    if (displup.pushed()) {
+      steering_wheel.displayNumber = (steering_wheel.displayNumber + 1)% DISPLAY_NUMBER_MAX; // increase by 1 and loop from 0 to 4
+    }
+    if (displdown.pushed()) {
+      steering_wheel.displayNumber = (steering_wheel.displayNumber + DISPLAY_NUMBER_MAX - 1) % DISPLAY_NUMBER_MAX; // decrease by 1 and loop from 0 to 4
+    }
   }  
 
   /* if switch state changes, or timer runs out, update the screen*/
@@ -401,7 +482,7 @@ void loop() {
   // Check whether a CAN packet has been loaded and is available to read:
   if (CanControl.Available()){
     
-    // Use available CAN packets (BMS SOC and MC Velocity) to assign values to appropriate members of the data structures
+    // Use available CAN packets to assign values to appropriate members of the data structures
     Frame& f = CanControl.Read();
  #ifdef DEBUG
     Serial.print("Received: " );
@@ -409,26 +490,53 @@ void loop() {
  #endif
     switch (f.id)
     {
-      /*case BMS_SOC_ID:
+      case BMS_VOLT_CURR_ID:
       {
-        BMS_SOC packet(f); //This is where we get the State of charge
-        steering_wheel.SOCdisplay = packet.percent_SOC*100;
-        #ifdef DEBUG
-          Serial.print(steering_wheel.SOCdisplay);
-        #endif
-        CAN_RX.reset();
-        break;
-      }*/
-      case MC_VELOCITY_ID:
-      {
-        MC_Velocity packet(f); // This is where we get the velocity
-        steering_wheel.Veldisplay = packet.car_velocity*MPS_TO_MPH;
-        #ifdef DEBUG
-          Serial.print(steering_wheel.Veldisplay);
-        #endif
+        BMS_VoltageCurrent packet(f); //Get the voltage and current of the battery pack
+        steering_wheel.BCurrentdisplay = packet.current;
+        steering_wheel.BVoltagedisplay = packet.voltage;
         CAN_RX.reset();
         break;
       }
+      case MC_VELOCITY_ID:
+      {
+        MC_Velocity packet(f); // Get Velocity
+        steering_wheel.Veldisplay = packet.car_velocity*MPS_TO_MPH;
+        CAN_RX.reset();
+        break;
+      }
+      case MC_BUS_STATUS_ID:
+      {
+        MC_BusStatus packet(f); // Get Motor Current
+        steering_wheel.MCurrentdisplay = packet.bus_current;
+        CAN_RX.reset();
+        break;
+      }
+      case DC_TEMP_0_ID:
+      {
+        DC_Temp_0 packet(f); // Get Max Pack Temp
+        steering_wheel.MaxTempdisplay = packet.max_temp;
+        CAN_RX.reset();
+        break;
+      }
+      case DC_INFO_ID:
+      {
+        DC_Info packet(f); // Get Tripped state of vehicle
+        steering_wheel.tripped = packet.tripped;
+        steering_wheel.notification = GENERIC_TRIP_STR;
+        notif_timer.reset();
+        CAN_RX.reset();
+        break;
+      }
+      /*case BMS_STATUS_EXT_ID:
+      {
+        BMS_Status_Ext packet(f); // extract the flags
+        if      (packet.flags & BMS_Status_Ext::F_OVERVOLTAGE)    {notif_timer.reset(); steering_wheel.notification = BMS_OVVOLTAGE_STR;}
+        else if (packet.flags & BMS_Status_Ext::F_UNDERVOLTAGE)   {notif_timer.reset(); steering_wheel.notification = BMS_UNVOLTAGE_STR;}
+        else if (packet.flags & BMS_Status_Ext::F_12VLOW)         {notif_timer.reset(); steering_wheel.notification = BMS_12VERR_STR;}
+        CAN_RX.reset();
+        break;
+      }*/
       case TEL_HEARTBEAT_ID:
       {
         steering_wheel.telemetrydisplay = 'T';
@@ -436,14 +544,13 @@ void loop() {
       }
     }
   }
-  // else if (CAN_RX.check()){
-  // 	notif_timer().reset();
-  // 	steering_wheel.notification = "Comm. lost with Driver Controls!"
-  // } I guess we'll implement this later, since it hasn't been checked. 
   
   //Debug for CAN
   CanControl.FetchErrors();
   CanControl.FetchStatus();
+
+  //Update Array Current display value
+  steering_wheel.ACurrentdisplay = steering_wheel.MCurrentdisplay - steering_wheel.BCurrentdisplay;
 
   #ifdef DEBUG
     loopSumTime += (micros() - loopStartTime);
